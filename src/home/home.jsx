@@ -32,8 +32,10 @@ export default function Home() {
   const isProcessingRef = useRef(false)
   const isAwakeRef = useRef(false)
   const isSpeakingRef = useRef(false)
-  const recognitionActiveRef = useRef(false)
-  const manuallyStoppedRef = useRef(false)
+  const lastErrorTimeRef = useRef(0)
+  const restartCountRef = useRef(0)
+  const lastRestartTimeRef = useRef(0)
+  const restartTimerRef = useRef(null)
   
   const timeDate = new Date()
   const hours = String(timeDate.getHours()).padStart(2, '0')
@@ -62,45 +64,30 @@ export default function Home() {
   const speakText = (text) => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel()
-
+      
       isSpeakingRef.current = true
       setIsSpeaking(true)
       setIsDetectingSpeech(false)
-
-      // Stop mic before speaking — flag it so onend doesn't auto-restart
-      if (recognitionRef.current && recognitionActiveRef.current) {
-        manuallyStoppedRef.current = true
-        try { recognitionRef.current.stop() } catch (e) {}
-      }
-
+      
       const utterance = new SpeechSynthesisUtterance(text)
       utterance.rate = 1
       utterance.pitch = 1
       utterance.volume = 1
       utterance.lang = 'en-US'
-
-      // A: Restart mic after speaking finishes
+      
       utterance.onend = () => {
-        isSpeakingRef.current = false
-        setIsSpeaking(false)
-        if (isListeningRef.current) {
-          setTimeout(() => {
-            if (!recognitionActiveRef.current) {
-              try { recognitionRef.current.start() } catch (e) { console.log(e) }
-            }
-          }, 500)
-        }
+        setTimeout(() => {
+          isSpeakingRef.current = false
+          setIsSpeaking(false)
+        }, 1500) // Increase delay slightly to 1.5s to ensure no echoes slip through
       }
-
+      
       utterance.onerror = (error) => {
         console.error('Speech synthesis error:', error)
         isSpeakingRef.current = false
         setIsSpeaking(false)
-        if (isListeningRef.current && !recognitionActiveRef.current) {
-          try { recognitionRef.current.start() } catch (e) {}
-        }
       }
-
+      
       window.speechSynthesis.speak(utterance)
     } else {
       console.error('Speech Synthesis not supported')
@@ -127,13 +114,7 @@ export default function Home() {
       const response = await generateContent(`You are Alvi, a helpful AI assistant. Keep responses concise (under 50 words). User says: ${text}`)
       showSubtitle(response || 'No response')
     } catch (error) {
-      const msg = error?.message || ''
-      if (msg.includes('rate limit') || msg.includes('429')) {
-        showSubtitle('All API keys are busy right now. Please wait a moment.')
-      } else {
-        showSubtitle('Sorry, I had trouble connecting. Please try again.')
-      }
-      console.error('Gemini call failed:', msg)
+      showSubtitle('Error: ' + error.message)
     } finally {
       setIsThinking(false)
       isProcessingRef.current = false
@@ -151,54 +132,55 @@ export default function Home() {
       recognitionRef.current.maxAlternatives = 1
 
       recognitionRef.current.onstart = () => {
-        recognitionActiveRef.current = true
-        console.log('🎤 [1] Recognition started')
+        console.log('🎤 Recognition started - listening for speech')
       }
-      recognitionRef.current.onaudiostart = () => console.log('🔊 [2] Audio capture started')
-      recognitionRef.current.onsoundstart = () => console.log('📢 [3] Sound detected')
-      recognitionRef.current.onspeechstart = () => console.log('🗣️ [4] Speech detected')
-      recognitionRef.current.onspeechend  = () => console.log('🔇 [5] Speech ended')
-      recognitionRef.current.onsoundend   = () => console.log('🔕 [6] Sound ended')
-      recognitionRef.current.onaudioend   = () => console.log('⏹️ [7] Audio capture ended')
-
 
       recognitionRef.current.onresult = (event) => {
-        // Drop audio while AI is speaking
-        if (isSpeakingRef.current) return
-
+        // Drop any audio picked up while AI is speaking or processing
+        if (isSpeakingRef.current || isProcessingRef.current) return
+        
         let interimTranscript = ''
-
+        
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript.toLowerCase().trim()
-
+          
+          // Show interim results
           if (!event.results[i].isFinal) {
-            setSubtitle('')
+            setSubtitle('') // clear any old AI subtitle so user's transcript shows
             interimTranscript += transcript + ' '
             setIsDetectingSpeech(true)
             setCurrentTranscript(interimTranscript.trim())
           } else {
+            // Final result
             setIsDetectingSpeech(false)
             setCurrentTranscript('')
             console.log('✓ Final transcript:', transcript)
-
+            restartCountRef.current = 0 // Reset backoff — speech was captured successfully
+            
+            // Check for wake-up phrases
             const isWakeWord = transcript.includes('alvi') || transcript.includes('albi') || transcript.includes('alby')
-
+            
             if (!isAwakeRef.current && isWakeWord) {
               setIsAwake(true)
               isAwakeRef.current = true
               showSubtitle('Alvi here! How can I help you?')
               return
             }
-
+            
             if (isAwakeRef.current && transcript) {
               setIsProcessing(true)
               isProcessingRef.current = true
-
+              
+              // Remove wake words and punctuation from the command
               const cleanedTranscript = transcript
-                .replace(/alvi/gi, '').replace(/albi/gi, '').replace(/alby/gi, '')
-                .replace(/hi /gi, '').replace(/hey /gi, '')
-                .replace(/[.,!?]/g, '').trim()
-
+                .replace(/alvi/gi, '')
+                .replace(/albi/gi, '')
+                .replace(/alby/gi, '')
+                .replace(/hi /gi, '')
+                .replace(/hey /gi, '')
+                .replace(/[.,!?]/g, '')
+                .trim()
+              
               if (cleanedTranscript) {
                 callGemini(cleanedTranscript)
               } else {
@@ -213,36 +195,48 @@ export default function Home() {
       }
 
       recognitionRef.current.onerror = (event) => {
-        console.error('❌ Recognition error:', event.error, event.message)
+        if (event.error !== 'network') {
+          console.error('❌ Speech recognition error:', event.error)
+        }
         setIsDetectingSpeech(false)
+        if (event.error === 'network') {
+          lastErrorTimeRef.current = Date.now()
+        }
       }
 
       recognitionRef.current.onend = () => {
-        recognitionActiveRef.current = false
         setIsDetectingSpeech(false)
 
-        // If we manually stopped for TTS, block auto-restart here.
-        // utterance.onend will restart it instead — preventing double-start.
-        if (manuallyStoppedRef.current) {
-          manuallyStoppedRef.current = false
-          return
-        }
+        if (!isListeningRef.current || isSpeakingRef.current || isProcessingRef.current) return
 
-        if (
-          isListeningRef.current &&
-          !isSpeakingRef.current &&
-          !isProcessingRef.current
-        ) {
-          setTimeout(() => {
-            if (!recognitionActiveRef.current) {
-              try {
-                recognitionRef.current.start()
-              } catch (e) {
-                console.log('Restart failed:', e)
-              }
-            }
-          }, 1000)
+        // Clear any pending restart
+        if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
+
+        // Track how fast we are restarting
+        const now = Date.now()
+        const timeSinceLastRestart = now - lastRestartTimeRef.current
+        if (timeSinceLastRestart < 3000) {
+          // Restarting too fast — increment counter
+          restartCountRef.current = Math.min(restartCountRef.current + 1, 8)
+        } else {
+          // Long gap since last restart — reset counter
+          restartCountRef.current = 0
         }
+        lastRestartTimeRef.current = now
+
+        // Exponential backoff: 300ms, 600ms, 1200ms, 2400ms... capped at 8s
+        const delay = Math.min(300 * Math.pow(2, restartCountRef.current), 8000)
+        console.log(`⟳ Restarting recognition in ${delay}ms (attempt ${restartCountRef.current})`)
+
+        restartTimerRef.current = setTimeout(() => {
+          try {
+            if (recognitionRef.current && isListeningRef.current && !isSpeakingRef.current) {
+              recognitionRef.current.start()
+            }
+          } catch (error) {
+            console.error('Error restarting:', error)
+          }
+        }, delay)
       }
     } else {
       console.error('❌ Speech Recognition API not supported in this browser')
@@ -252,23 +246,31 @@ export default function Home() {
       isListeningRef.current = false
       if (recognitionRef.current) {
         try {
-          recognitionRef.current.stop() // C: use stop() not abort()
-        } catch (error) {}
+          recognitionRef.current.abort()
+        } catch (error) {
+          console.error('Error aborting recognition:', error)
+        }
       }
     }
   }, [])
 
   const startListening = () => {
-    if (recognitionRef.current && !recognitionActiveRef.current) {
+    if (recognitionRef.current) {
       console.log('Attempting to start listening...')
       isListeningRef.current = true
       setIsListening(true)
       try {
         recognitionRef.current.start()
         console.log('🎤 Started listening')
-        if (subtitleTimeoutRef.current) clearTimeout(subtitleTimeoutRef.current)
+        
+        // Just show text, don't speak it to avoid breaking the mic connection
+        if (subtitleTimeoutRef.current) {
+          clearTimeout(subtitleTimeoutRef.current)
+        }
         setSubtitle('Listening... say "hi alvi" to wake me up')
-        subtitleTimeoutRef.current = setTimeout(() => setSubtitle(''), 5000)
+        subtitleTimeoutRef.current = setTimeout(() => {
+          setSubtitle('')
+        }, 5000)
       } catch (error) {
         console.error('Error starting recognition:', error)
         isListeningRef.current = false
@@ -283,7 +285,7 @@ export default function Home() {
       isListeningRef.current = false
       setIsListening(false)
       try {
-        recognitionRef.current.stop()
+        recognitionRef.current.abort()
       } catch (error) {
         console.error('Error stopping:', error)
       }
@@ -424,33 +426,24 @@ export default function Home() {
         </div>
       )}
 
-      {/* Real-time Transcript Display — always show over subtitle */}
-      {currentTranscript && (
-        <div className="transcript-display">
-          <span className="transcript-label">YOU:</span> {currentTranscript}
-        </div>
-      )}
-
-      {/* Subtitle Display — only when not talking */}
-      {subtitle && !currentTranscript && (
+      {/* Subtitle Display */}
+      {subtitle && (
         <div className="subtitle-display">
           {subtitle}
         </div>
       )}
 
-      {/* Live audio bars — CSS animated, no extra mic stream */}
-      {isListening && !isSpeaking && !isProcessing && (
-        <div className={`audio-level-container ${isDetectingSpeech ? 'active' : ''}`}>
-          {Array.from({ length: 12 }).map((_, i) => (
-            <div key={i} className="audio-bar" style={{ animationDelay: `${i * 0.08}s` }} />
-          ))}
+      {/* Real-time Transcript Display */}
+      {currentTranscript && !subtitle && (
+        <div className="transcript-display">
+          <span className="transcript-label">YOU:</span> {currentTranscript}
         </div>
       )}
 
       {/* Listening Status */}
-      {isListening && !isSpeaking && !isProcessing && !currentTranscript && !isDetectingSpeech && (
+      {isListening && !isSpeaking && !isProcessing && !subtitle && !currentTranscript && (
         <div className="listening-status">
-          🎤 WAITING FOR SPEECH...
+          {isDetectingSpeech ? '🎤 LISTENING...' : '🎤 WAITING FOR SPEECH...'}
         </div>
       )}
 
